@@ -1,6 +1,9 @@
 open Printf
 open Sexplib
 
+module StrSet = Set.Make(String)
+module StrMap = Map.Make(String)
+
 (** {1 SMT Basics } *)
 
 type sexp = Sexp.t
@@ -508,6 +511,7 @@ let assume e = app_ "assert" [e]
 type solver_log =
   { send:    string -> unit   (** We sent this to the solver. *)
   ; receive: string -> unit   (** We got this from the solver. *)
+  ; stop:    unit   -> unit   (** Do this when done, (close files, etc.) *)
   }
 
 type solver_config =
@@ -520,8 +524,8 @@ type solver_config =
 (** A connection to a solver *)
 type solver =
   { command:    sexp -> sexp
-  ; stop:       unit -> Unix.process_status
-  ; force_stop: unit -> Unix.process_status
+  ; stop:       unit -> unit
+  ; force_stop: unit -> unit
   ; config:     solver_config
   }
 
@@ -531,7 +535,7 @@ let () =
   Printexc.register_printer
     (function
       | UnexpectedSolverResponse s ->
-        Some (Printf.sprintf "UnexpectedSolverResponse(%s)" (Sexp.to_string s))
+        Some (Printf.sprintf "UnexpectedSolverResponse(%s)" (Sexp.to_string_hum s))
       | _ -> None
     )
 
@@ -561,7 +565,80 @@ let check s =
 
 (** Get all definitions currently in scope. Only valid after a [Sat] result.
 See also {!model_eval}. *)
-let get_model s = s.command (list [ atom "get-model" ])
+let get_model s =
+  let ans = s.command (list [ atom "get-model" ]) in
+  match s.config.exts with
+  | CVC5  -> ans
+  | Other -> ans
+
+  | Z3 ->
+      (* Workaround z3 bug #7270: remove `as-array` *)
+      let rec drop_as_array x =
+          match x with
+          | Sexp.List [ _; Sexp.Atom "as-array"; f ] -> f
+          | Sexp.List xs -> Sexp.List (List.map drop_as_array xs)
+          | _ -> x
+      in
+
+      (* Workaround for a z3 bug #7268: rearrange defs in dep. order *)
+      let add_binder bound x =
+            match x with
+            | Sexp.List [Sexp.Atom v; _ty_or_term ] -> StrSet.add v bound
+            | _ -> raise (UnexpectedSolverResponse x)
+      in
+      let add_bound = List.fold_left add_binder in
+
+      let rec free bound vars x =
+            match x with
+            | Sexp.Atom a  -> if StrSet.mem a bound then vars else a :: vars
+            | Sexp.List [ Sexp.Atom q; Sexp.List vs; body ]
+              when String.equal q "forall"
+                || String.equal q "exist"
+                || String.equal q "let" -> free (add_bound bound vs) vars body
+            | Sexp.List xs -> List.fold_left (free bound) vars xs
+      in
+      let check_def x =
+            match x with
+            | Sexp.List
+                [ _def_fun; Sexp.Atom name; Sexp.List args; _ret; def ] ->
+                let bound = add_bound StrSet.empty args in
+                (name, free bound [] def, x)
+            | _ -> raise (UnexpectedSolverResponse ans)
+      in
+      match ans with
+      | Sexp.Atom _ -> raise (UnexpectedSolverResponse ans)
+      | Sexp.List xs ->
+        let defs                = List.map check_def xs in
+        let add_dep mp (x,xs,e) = StrMap.add x (xs,e) mp in
+        let deps                = List.fold_left add_dep StrMap.empty defs in
+
+        let processing = ref StrSet.empty in
+        let processed  = ref StrSet.empty in
+        let decls      = ref [] in
+        let rec arrange todo =
+            match todo with
+            | x :: xs ->
+              if StrSet.mem x !processed
+                then arrange xs
+                else begin
+                  if StrSet.mem x !processing
+                    then raise (UnexpectedSolverResponse ans) (* recursive *)
+                    else
+                      begin match StrMap.find_opt x deps with
+                      | None -> arrange xs
+                      | Some (ds,e) ->
+                        processing := StrSet.add x !processing;
+                        arrange ds;
+                        processing := StrSet.remove x !processing;
+                        processed  := StrSet.add x !processed;
+                        decls      := drop_as_array e :: !decls;
+                        arrange xs
+                      end
+                end
+            | [] -> ()
+           in
+        arrange (List.map (fun (x,_,_) -> x) defs);
+        list (List.rev !decls)
 
 (** Get the values of some s-expressions. Only valid after a [Sat] result.
     Throws {!UnexpectedSolverResponse}. *)
@@ -584,6 +661,44 @@ let get_expr s v: sexp =
   match res with
   | Sexp.List [ Sexp.List [_;x] ] -> x
   | _ -> raise (UnexpectedSolverResponse res)
+
+
+let is_let (exp: sexp): (sexp StrMap.t * sexp) option =
+  match exp with
+  | Sexp.List [ Sexp.Atom "let"; Sexp.List binds; body ] ->
+    let add_bind mp bind =
+        match bind with
+        | Sexp.List [ Sexp.Atom x; y ] -> StrMap.add x y mp
+        | _ -> raise (UnexpectedSolverResponse bind)
+    in
+    let su = List.fold_left add_bind StrMap.empty binds in
+    Some (su, body)
+  | _ -> None
+
+(** Expand let-definitions in this term.
+ NOTE: this is intended to be used mostly on models generated by the
+ solver (e.g., `get-value` in Z3 sometimes contains `let`).  As such
+ we assume that `forall` and `exist` won't occur, and so we don't need
+ to check for variable capture. *)
+let no_let (exp0: sexp): sexp =
+  let rec expand su exp =
+          match is_let exp with
+          | Some (binds,body) ->
+            let binds1   = StrMap.map (expand su) binds in
+            let jn _ x _ = Some x in
+            let su1      = StrMap.union jn binds1 su in
+            expand su1 body
+          | None ->
+            match exp with
+            | Sexp.List xs -> Sexp.List (List.map (expand su) xs)
+            | Sexp.Atom x ->
+              match StrMap.find_opt x su with
+              | Some e1 -> e1
+              | None    -> exp
+  in
+  expand StrMap.empty exp0
+
+
 
 (** Try to decode an s-expression as a boolean
     Throws {!UnexpectedSolverResponse}. *)
@@ -691,20 +806,22 @@ let new_solver (cfg: solver_config): solver =
         fprintf out_chan "%s\n%!" s in
 
   let send_command c =
-        send_string (Sexp.to_string c);
+        send_string (Sexp.to_string_hum c);
         let ans = match Sexp.scan_sexp_opt in_buf with
                     | Some x -> x
                     | None -> Sexp.Atom (In_channel.input_all in_err_chan)
-        in cfg.log.receive (Sexp.to_string ans); ans
+        in cfg.log.receive (Sexp.to_string_hum ans); ans
   in
 
   let stop_command () =
         send_string "(exit)";
-        Unix.close_process_full proc
+        let _ = Unix.close_process_full proc in
+        cfg.log.stop ()
   in
   let force_stop_command () =
         Unix.kill pid 9;
-        Unix.close_process_full proc
+        let _ = Unix.close_process_full proc in
+        cfg.log.stop ()
   in
   let s =
     { command = send_command
@@ -715,7 +832,7 @@ let new_solver (cfg: solver_config): solver =
   in
     ack_command s (set_option ":print-success" "true");
     ack_command s (set_option ":produce-models" "true");
-    Gc.finalise (fun me -> let _ = me.stop () in ()) s;
+    Gc.finalise (fun me -> me.stop ()) s;
     s
 
 (** A connection to a solver,
@@ -723,8 +840,8 @@ let new_solver (cfg: solver_config): solver =
 type model_evaluator =
   { eval:       (string * (string*sexp) list * sexp * sexp) list -> sexp -> sexp
 (** First define some local variables, then evaluate the expression *)
-  ; stop:       unit -> Unix.process_status
-  ; force_stop: unit -> Unix.process_status
+  ; stop:       unit -> unit
+  ; force_stop: unit -> unit
   }
 
 
@@ -776,11 +893,13 @@ let model_eval (cfg: solver_config) (m: sexp) =
 let quiet_log =
   { send    = (fun _ -> ())
   ; receive = (fun _ -> ())
+  ; stop    = (fun _ -> ())
   }
 
 let printf_log =
   { send    = (fun s -> printf "[->] %s\n%!" s)
   ; receive = (fun s -> printf "[<-] %s\n%!" s)
+  ; stop    = (fun _ -> ())
   }
 
 let cvc5 : solver_config =
