@@ -523,10 +523,11 @@ type solver_config =
 
 (** A connection to a solver *)
 type solver =
-  { command:    sexp -> sexp
-  ; stop:       unit -> unit
-  ; force_stop: unit -> unit
-  ; config:     solver_config
+  { command:     sexp -> sexp
+  ; stop:        unit -> unit
+  ; force_stop:  unit -> unit
+  ; config:      solver_config
+  ; raw_command: string -> sexp
   }
 
 exception UnexpectedSolverResponse of sexp
@@ -805,13 +806,15 @@ let new_solver (cfg: solver_config): solver =
         cfg.log.send s;
         fprintf out_chan "%s\n%!" s in
 
-  let send_command c =
-        send_string (Sexp.to_string_hum c);
-        let ans = match Sexp.scan_sexp_opt in_buf with
-                    | Some x -> x
-                    | None -> Sexp.Atom (In_channel.input_all in_err_chan)
-        in cfg.log.receive (Sexp.to_string_hum ans); ans
+  let send_raw_command s =
+    send_string s;
+    let ans = match Sexp.scan_sexp_opt in_buf with
+                | Some x -> x
+                | None -> Sexp.Atom (In_channel.input_all in_err_chan)
+    in cfg.log.receive (Sexp.to_string_hum ans); ans
   in
+
+  let send_command c = send_raw_command (Sexp.to_string_hum c) in
 
   let stop_command () =
         send_string "(exit)";
@@ -828,6 +831,7 @@ let new_solver (cfg: solver_config): solver =
     ; stop = stop_command
     ; force_stop = force_stop_command
     ; config = cfg
+    ; raw_command = send_raw_command
     }
   in
     ack_command s (set_option ":print-success" "true");
