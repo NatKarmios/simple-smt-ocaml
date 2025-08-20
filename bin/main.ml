@@ -116,7 +116,7 @@ let main () =
   let arr = atom "arr" in
   ack_command s (assume (arr_select arr (int_k 10)));
   check_sat s;
-  let (xs,res) = to_array (get_expr s arr) in
+  let (_,_) = to_array (get_expr s arr) in
 
 
   ack_command s (define "arr2" (t_array t_int t_int)
@@ -126,7 +126,7 @@ let main () =
                       ));
   let arr2 = atom "arr2" in
   check_sat s;
-  let (xs2,res2) = to_array (get_expr s arr2) in
+  let (_,_) = to_array (get_expr s arr2) in
 
 
 
